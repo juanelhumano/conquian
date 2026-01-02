@@ -10,7 +10,6 @@ app.config['SECRET_KEY'] = 'secreto_conquian_mx'
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Cambiado a async_mode=None para evitar crasheos si eventlet no está instalado
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode=None)
 
 rooms = {}
@@ -35,7 +34,6 @@ def get_player_list(room_code):
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    """Maneja la desconexión para limpiar el Lobby si no ha empezado el juego."""
     for code, room in rooms.items():
         player = next((p for p in room['players'] if p['id'] == request.sid), None)
         if player:
@@ -45,7 +43,7 @@ def handle_disconnect():
                 emit('lobby_update', {'players': current_list}, room=code)
                 logger.info(f"Jugador {player['alias']} salió del Lobby {code}")
             else:
-                logger.info(f"Jugador {player['alias']} desconectado en partida (esperando reconexión).")
+                logger.info(f"Jugador {player['alias']} desconectado en partida.")
             break
 
 @socketio.on('create_room')
@@ -64,7 +62,7 @@ def handle_create_room(data):
             "turn_owner_index": 0,  
             "offer_index": 0,       
             "refusals": 0,
-            "exchange_buffer": {}   # Ahora guardará { 'ALIAS': Carta }
+            "exchange_buffer": {}
         }
         
         join_room(room_code)
@@ -90,40 +88,46 @@ def handle_join_room(data):
         
         if existing_player:
             logger.info(f"Reconexión detectada para {alias}")
-            existing_player['id'] = request.sid # Actualizar ID socket
+            existing_player['id'] = request.sid 
             join_room(room_code)
             
             current_list = get_player_list(room_code)
             emit('player_joined', {'alias': alias, 'roomCode': room_code, 'players': current_list})
             
-            # Restaurar estado del juego
+            # Restaurar estado si el juego ya inició
             if room['phase'] != 'LOBBY':
-                # Primero, asegurar que tenga sus cartas
+                # 1. Enviar ESTADO GENERAL para sincronizar fase (desbloquea UI)
+                try:
+                    # Cálculo seguro de variables aunque estemos en Exchange
+                    if room['players']:
+                        curr_p = room['players'][room['offer_index']]
+                        act_id, act_al = curr_p['id'], curr_p['alias']
+                        turn_ow = room['players'][room['turn_owner_index']]['alias']
+                    else:
+                        act_id, act_al, turn_ow = None, '', ''
+                except:
+                    act_id, act_al, turn_ow = None, '', ''
+
+                state = {
+                    'phase': room['phase'],
+                    'currentCard': room['current_card'],
+                    'activePlayerId': act_id,
+                    'activePlayerAlias': act_al,
+                    'deckCount': len(room['deck']),
+                    'allMelds': {p['id']: p['melds'] for p in room['players']},
+                    'turnOwnerAlias': turn_ow
+                }
+                emit('game_state_update', state, room=request.sid)
+
+                # 2. Restaurar MANO
                 emit('hand_update', {'hand': existing_player['hand']}, room=request.sid)
                 
-                # FIX ESPECÍFICO PARA PANTALLA DESVANECIDA EN INTERCAMBIO
+                # 3. Lógica específica de EXCHANGE (Pantalla de espera o selección)
                 if room['phase'] == 'EXCHANGE':
-                    # Si ya entregó carta, mostrar pantalla de espera
                     if alias in room['exchange_buffer']:
                         emit('exchange_wait', {'msg': 'Esperando a los demás...'}, room=request.sid)
                     else:
-                        # Si no ha entregado, permitirle jugar
                         emit('game_start_exchange', {'hand': existing_player['hand']}, room=request.sid)
-                
-                else:
-                    # En fases normales de juego, enviar estado completo
-                    active_player = room['players'][room['offer_index']]
-                    all_melds = {p['id']: p['melds'] for p in room['players']}
-                    state = {
-                        'phase': room['phase'],
-                        'currentCard': room['current_card'],
-                        'activePlayerId': active_player['id'],
-                        'activePlayerAlias': active_player['alias'],
-                        'deckCount': len(room['deck']),
-                        'allMelds': all_melds,
-                        'turnOwnerAlias': room['players'][room['turn_owner_index']]['alias']
-                    }
-                    emit('game_state_update', state, room=request.sid)
             return
         # ----------------------
 
@@ -157,8 +161,21 @@ def handle_start_request(data):
 
     room['deck'] = create_spanish_deck()
     room['phase'] = "EXCHANGE"
-    room['exchange_buffer'] = {} # Limpiar buffer
+    room['exchange_buffer'] = {} 
     
+    # IMPORTANTE: Notificar cambio de fase a TODOS.
+    # Esto asegura que el cliente sepa que ya NO es Lobby y habilite la interacción.
+    state_update = {
+        'phase': 'EXCHANGE',
+        'currentCard': None,
+        'activePlayerId': None, 
+        'activePlayerAlias': '',
+        'deckCount': len(room['deck']),
+        'allMelds': {p['id']: [] for p in room['players']},
+        'turnOwnerAlias': ''
+    }
+    emit('game_state_update', state_update, room=room_code)
+
     for player in room['players']:
         player['hand'] = [room['deck'].pop() for _ in range(9)]
         player['melds'] = []
@@ -176,7 +193,6 @@ def handle_exchange(data):
     player = next((p for p in room['players'] if p['id'] == request.sid), None)
     if not player: return
 
-    # FIX: Evitar doble envío si ya está en buffer (por clicks rápidos o lag)
     if player['alias'] in room['exchange_buffer']:
         return
 
@@ -187,7 +203,6 @@ def handle_exchange(data):
             break
     
     if card_obj:
-        # FIX: Usar ALIAS como clave, no el ID del socket
         room['exchange_buffer'][player['alias']] = card_obj
         emit('exchange_wait', {'msg': 'Esperando...'}, room=request.sid)
 
@@ -202,17 +217,14 @@ def perform_exchange(room_code):
     for i in range(count):
         giver_idx = (i - 1) % count
         receiver = players[i]
-        
         giver_player = players[giver_idx]
         
-        # FIX: Recuperar carta usando el ALIAS del que la dio
         card = room['exchange_buffer'].get(giver_player['alias'])
         
         if card:
             receiver['hand'].append(card)
             emit('exchange_complete', {'newHand': receiver['hand'], 'receivedCard': card}, room=receiver['id'])
 
-    # --- INICIO JUEGO ---
     start_player_idx = 1 % count
     room['turn_owner_index'] = start_player_idx
     draw_new_card_to_table(room_code)
