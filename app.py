@@ -32,7 +32,6 @@ def generate_room_code():
     return ''.join(random.choices(string.ascii_uppercase, k=4))
 
 def get_player_list(room_code):
-    """Ayuda a formatear la lista de jugadores para el cliente."""
     if room_code not in rooms: return []
     room = rooms[room_code]
     return [{'alias': p['alias'], 'isHost': (p['id'] == room['host_sid'])} for p in room['players']]
@@ -52,7 +51,7 @@ def handle_create_room(data):
             "players": [{"id": request.sid, "alias": alias, "hand": []}],
             "deck": [],
             "discard_pile": [],
-            "phase": "LOBBY", # LOBBY, EXCHANGE, OFFER, PLAYING, DISCARDING
+            "phase": "LOBBY", 
             "turn_origin_index": 0,
             "offer_index": 0,
             "refusals": 0,
@@ -61,11 +60,8 @@ def handle_create_room(data):
         }
         
         join_room(room_code)
-        
-        # Enviamos la lista INMEDIATAMENTE en la confirmación
         current_list = get_player_list(room_code)
         emit('room_created', {'roomCode': room_code, 'alias': alias, 'isHost': True, 'players': current_list})
-        
         logger.info(f"Sala {room_code} creada por {alias}")
     except Exception as e:
         logger.error(f"Error create_room: {e}")
@@ -73,29 +69,24 @@ def handle_create_room(data):
 @socketio.on('join_room')
 def handle_join_room(data):
     try:
-        # Aseguramos mayúsculas y quitamos espacios
         room_code = data.get('roomCode', '').upper().strip()
         alias = data.get('alias', '').strip()
         
-        logger.info(f"Intento de join: {alias} a sala {room_code}")
-        
         if room_code not in rooms:
-            emit('error', {'msg': 'Sala no existe o código incorrecto'})
+            emit('error', {'msg': 'Sala no existe'})
             return
         
         room = rooms[room_code]
         
         if room['phase'] != 'LOBBY':
-            emit('error', {'msg': 'El juego ya comenzó'})
+            emit('error', {'msg': 'Juego ya iniciado'})
             return
 
         if len(room['players']) >= 4:
-            emit('error', {'msg': 'Sala llena (máx 4)'})
+            emit('error', {'msg': 'Sala llena'})
             return
         
-        # Evitar duplicados por doble click
         if any(p['id'] == request.sid for p in room['players']):
-            # Si ya está, solo le enviamos el estado actual
             current_list = get_player_list(room_code)
             emit('player_joined', {'alias': alias, 'roomCode': room_code, 'players': current_list})
             return
@@ -103,14 +94,9 @@ def handle_join_room(data):
         room['players'].append({"id": request.sid, "alias": alias, "hand": []})
         join_room(room_code)
         
-        # Notificamos a TODOS en la sala con la lista actualizada
         current_list = get_player_list(room_code)
-        # Emitimos a la sala para que otros actualicen
         emit('lobby_update', {'players': current_list}, room=room_code)
-        # Emitimos al que entró confirmación específica para que cambie de pantalla
         emit('player_joined', {'alias': alias, 'roomCode': room_code, 'players': current_list}, room=request.sid)
-        
-        logger.info(f"Jugador {alias} unido a {room_code}")
         
     except Exception as e:
         logger.error(f"Error join_room: {e}")
@@ -120,12 +106,9 @@ def handle_start_request(data):
     room_code = data.get('roomCode')
     room = rooms.get(room_code)
     
-    if not room: return
-    if request.sid != room['host_sid']:
-        return 
-    
+    if not room or request.sid != room['host_sid']: return
     if len(room['players']) < 2:
-        emit('error', {'msg': 'Mínimo 2 jugadores para iniciar'})
+        emit('error', {'msg': 'Mínimo 2 jugadores'})
         return
 
     # Iniciar Fase de Intercambio
@@ -139,7 +122,7 @@ def handle_start_request(data):
         room['melds'][player['id']] = []
         emit('game_start_exchange', {'hand': player['hand']}, room=player['id'])
     
-    emit('system_msg', {'msg': 'Fase de Intercambio: Selecciona una carta para pasar a la derecha.'}, room=room_code)
+    emit('system_msg', {'msg': 'Selecciona una carta para pasar.'}, room=room_code)
 
 @socketio.on('submit_exchange_card')
 def handle_exchange(data):
@@ -149,11 +132,10 @@ def handle_exchange(data):
     
     if not room or room['phase'] != "EXCHANGE": return
     
-    # Guardar carta seleccionada
     player = next((p for p in room['players'] if p['id'] == request.sid), None)
     if not player: return
 
-    # Verificar que tiene la carta
+    # Extraer carta
     card_obj = None
     for i, c in enumerate(player['hand']):
         if c['id'] == card_id:
@@ -164,7 +146,7 @@ def handle_exchange(data):
         room['exchange_buffer'][request.sid] = card_obj
         emit('exchange_wait', {'msg': 'Esperando a otros...'}, room=request.sid)
 
-    # Si todos enviaron, rotar
+    # Verificar si todos terminaron
     if len(room['exchange_buffer']) == len(room['players']):
         perform_exchange(room_code)
 
@@ -173,8 +155,9 @@ def perform_exchange(room_code):
     players = room['players']
     count = len(players)
     
+    # Rotar cartas (Pasa a la derecha -> Recibe de la izquierda)
     for i in range(count):
-        giver_idx = (i - 1) % count # El de la izquierda
+        giver_idx = (i - 1) % count
         receiver = players[i]
         giver_sid = players[giver_idx]['id']
         
@@ -183,19 +166,24 @@ def perform_exchange(room_code):
         
         emit('exchange_complete', {'newHand': receiver['hand'], 'receivedCard': card}, room=receiver['id'])
 
-    # Iniciar juego real
-    room['turn_origin_index'] = 0 
+    # --- INICIO DEL JUEGO REAL ---
+    # El turno empieza con el jugador a la derecha del Host (indice 1)
+    # Suponiendo P0 es Host.
+    start_player_idx = 1 % count
     
-    first_card = room['deck'].pop()
-    room['discard_pile'].append(first_card)
+    # Voltear primera carta del mazo al descarte
+    if room['deck']:
+        first_card = room['deck'].pop()
+        room['discard_pile'].append(first_card)
     
-    start_offer_phase(room_code, room['turn_origin_index'])
+    # Iniciar la oferta dirigida a ese primer jugador
+    start_offer_phase(room_code, start_player_idx)
 
 def start_offer_phase(room_code, origin_idx):
     room = rooms[room_code]
     room['phase'] = "OFFER"
     room['turn_origin_index'] = origin_idx
-    room['offer_index'] = origin_idx 
+    room['offer_index'] = origin_idx # Empieza decidiendo él
     room['refusals'] = 0 
     
     notify_offer_state(room_code)
@@ -203,12 +191,13 @@ def start_offer_phase(room_code, origin_idx):
 def notify_offer_state(room_code):
     room = rooms[room_code]
     current_offer_player = room['players'][room['offer_index']]
-    top_card = room['discard_pile'][-1]
+    top_card = room['discard_pile'][-1] if room['discard_pile'] else None
     
     state = {
         'phase': 'OFFER',
         'topCard': top_card,
         'activePlayerId': current_offer_player['id'],
+        'activePlayerAlias': current_offer_player['alias'], # Enviamos alias para mostrar quién juega
         'originPlayerId': room['players'][room['turn_origin_index']]['id'],
         'deckCount': len(room['deck'])
     }
@@ -226,11 +215,12 @@ def handle_offer_response(data):
     if request.sid != current_player['id']: return
     
     if action == 'take':
-        card = room['discard_pile'].pop()
-        current_player['hand'].append(card)
+        if room['discard_pile']:
+            card = room['discard_pile'].pop()
+            current_player['hand'].append(card)
         
         room['phase'] = "DISCARDING"
-        # El turno pasa a ser de quien tomó la carta
+        # El turno se consolida con quien tomó la carta
         room['turn_origin_index'] = room['offer_index'] 
         
         emit('hand_update', {'hand': current_player['hand']}, room=request.sid)
@@ -238,21 +228,23 @@ def handle_offer_response(data):
         emit('game_state_update', {
             'phase': 'DISCARDING',
             'activePlayerId': current_player['id'],
+            'activePlayerAlias': current_player['alias'],
             'topCard': None,
             'deckCount': len(room['deck'])
         }, room=room_code)
         
         if len(current_player['hand']) == 10:
-             emit('system_msg', {'msg': f'¡{current_player["alias"]} tiene 10 cartas!'}, room=room_code)
+             emit('system_msg', {'msg': f'¡{current_player["alias"]} completó 10 cartas!'}, room=room_code)
 
     elif action == 'pass':
         room['refusals'] += 1
         
         if room['refusals'] >= len(room['players']):
-            # Nadie quiso, el dueño original roba
+            # Nadie quiso la carta de la mesa
             owner_idx = room['turn_origin_index']
             owner = room['players'][owner_idx]
             
+            # El dueño del turno roba del mazo
             if room['deck']:
                 drawn_card = room['deck'].pop()
                 owner['hand'].append(drawn_card)
@@ -262,14 +254,16 @@ def handle_offer_response(data):
                 emit('game_state_update', {
                     'phase': 'DISCARDING',
                     'activePlayerId': owner['id'],
+                    'activePlayerAlias': owner['alias'],
                     'topCard': room['discard_pile'][-1] if room['discard_pile'] else None,
                     'deckCount': len(room['deck'])
                 }, room=room_code)
                 emit('system_msg', {'msg': f'Nadie quiso. {owner["alias"]} robó del mazo.'}, room=room_code)
             else:
-                emit('system_msg', {'msg': 'Se acabó el mazo.'}, room=room_code)
-                room['deck'] = create_spanish_deck() # Revolver simple
+                emit('system_msg', {'msg': 'Fin del mazo. Reiniciando...'}, room=room_code)
+                room['deck'] = create_spanish_deck() 
         else:
+            # Pasa la oferta al siguiente
             room['offer_index'] = (room['offer_index'] + 1) % len(room['players'])
             notify_offer_state(room_code)
 
@@ -281,6 +275,7 @@ def handle_discard(data):
     
     if not room or room['phase'] != 'DISCARDING': return
     
+    # Verificar que sea el jugador activo (definido por turn_origin_index ahora)
     current_player = room['players'][room['turn_origin_index']]
     if request.sid != current_player['id']: return
     
@@ -294,12 +289,19 @@ def handle_discard(data):
         room['discard_pile'].append(card_to_discard)
         emit('hand_update', {'hand': current_player['hand']}, room=request.sid)
         
+        # Pasar turno al siguiente jugador y voltear nueva carta para ofrecer
         next_idx = (room['turn_origin_index'] + 1) % len(room['players'])
-        start_offer_phase(room_code, next_idx)
+        
+        # Voltear siguiente carta del mazo para la nueva ronda
+        if room['deck']:
+            new_card = room['deck'].pop()
+            room['discard_pile'].append(new_card)
+            start_offer_phase(room_code, next_idx)
+        else:
+            emit('system_msg', {'msg': 'Se acabó el mazo'}, room=room_code)
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    # Simple log de desconexión
     logger.info(f"Cliente desconectado: {request.sid}")
 
 if __name__ == '__main__':
